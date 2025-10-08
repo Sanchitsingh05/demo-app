@@ -104,53 +104,52 @@ pipeline {
     }
 
     stage('Deploy to Minikube via Helm (main only)') {
-      when { branch 'main' }
-      steps {
-        script {
-          sh """
-            set -e
+  when { branch 'main' }
+  steps {
+    script {
+      sh """
+        set -e
 
-            # Add / refresh the chart repo
-            helm repo add demo-charts ${HELM_REPO_URL} --force-update || true
+        # Keep repo URL lowercase for safety
+        helm repo add demo-charts ${HELM_REPO_URL} --force-update || true
 
-            # Wait up to ~3 minutes for GitHub Pages to serve the updated index.yaml
-            FOUND=""
-            for i in {1..12}; do
-              helm repo update || true
-              # Does the repo list show our exact new version?
-              if helm search repo demo-charts/${APP_NAME} -l \
-                   | awk 'NR>1{print \$2}' \
-                   | grep -qx ${CHART_VERSION}; then
-                echo "Found ${APP_NAME} ${CHART_VERSION} in repo."
-                FOUND="yes"
-                break
-              fi
-              echo "Chart ${APP_NAME} ${CHART_VERSION} not visible yet. Waiting 15s... (\$i/12)"
-              sleep 15
-            done
+        # Wait up to ~3 minutes for GitHub Pages to serve updated index.yaml
+        ATTEMPTS=12
+        for i in \$(seq 1 \${ATTEMPTS}); do
+          helm repo update || true
+          if helm search repo demo-charts/${APP_NAME} -l \
+               | awk 'NR>1{print \\$2}' \
+               | grep -qx ${CHART_VERSION}; then
+            echo "Found ${APP_NAME} ${CHART_VERSION} in repo."
+            FOUND=yes
+            break
+          fi
+          echo "Chart ${APP_NAME} ${CHART_VERSION} not visible yet. Waiting 15s... (\$i/\${ATTEMPTS})"
+          sleep 15
+        done
 
-            if [ -z "\$FOUND" ]; then
-              echo "ERROR: Chart ${APP_NAME} ${CHART_VERSION} not visible in repo after waiting."
-              echo "Check gh-pages, index.yaml, and Pages propagation."
-              exit 1
-            fi
+        # Verify FOUND or bail cleanly
+        if ! helm search repo demo-charts/${APP_NAME} -l \
+             | awk 'NR>1{print \\$2}' | grep -qx ${CHART_VERSION}; then
+          echo "ERROR: ${APP_NAME} ${CHART_VERSION} still not visible in repo. Check gh-pages & index.yaml"
+          exit 1
+        fi
 
-            # Ensure namespace exists
-            kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
+        # Ensure namespace exists
+        kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
 
-            # Deploy specific version built in this run
-            helm upgrade --install demo demo-charts/${APP_NAME} \
-              --version ${CHART_VERSION} \
-              --namespace demo \
-              --set image.repository=${IMAGE} \
-              --set image.tag=${IMAGE_TAG} \
-              --set service.nodePort=30080 \
-              --wait --timeout 120s
-          """
-        }
-      }
+        # Deploy the exact version we just published
+        helm upgrade --install demo demo-charts/${APP_NAME} \
+          --version ${CHART_VERSION} \
+          --namespace demo \
+          --set image.repository=${IMAGE} \
+          --set image.tag=${IMAGE_TAG} \
+          --set service.nodePort=30080 \
+          --wait --timeout 120s
+      """
     }
   }
+}
 
   post {
     always {
