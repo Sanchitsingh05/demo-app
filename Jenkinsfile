@@ -1,16 +1,27 @@
 pipeline {
   agent any
   environment {
-    APP_NAME      = "demo"
+    // ==== adjust these to your accounts if different ====
+    APP_NAME       = "demo"
     DOCKERHUB_USER = "sanchit0305"
     IMAGE          = "${DOCKERHUB_USER}/${APP_NAME}"
+
+    // chart source lives in this repo (your app repo)
     HELM_CHART_DIR = "helm/demo"
+
+    // GitHub Pages repo that hosts packaged charts + index.yaml
     HELM_REPO_GH   = "Sanchitsingh05/helm-charts"
-    HELM_REPO_URL  = "https://sanchitsingh05.github.io/helm-charts"  // lower-case safer
+    HELM_REPO_URL  = "https://Sanchitsingh05.github.io/helm-charts"
+    // ====================================================
   }
-  options { timestamps() }
+  options {
+    timestamps()
+    // optional: avoid overlapping deploys
+    // disableConcurrentBuilds()
+  }
 
   stages {
+
     stage('Checkout') {
       steps {
         checkout scm
@@ -22,13 +33,17 @@ pipeline {
       steps {
         script {
           def SHA = sh(returnStdout: true, script: 'cat .git/shortsha').trim()
+
           sh """
+            set -e
             docker build -t ${IMAGE}:${SHA} -t ${IMAGE}:latest .
           """
+
           withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
                                            usernameVariable: 'DH_USER',
                                            passwordVariable: 'DH_PASS')]) {
             sh """
+              set -e
               echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
               docker push ${IMAGE}:${SHA}
               docker push ${IMAGE}:latest
@@ -44,29 +59,43 @@ pipeline {
       steps {
         script {
           sh 'helm version && kubectl version --client'
+
+          // --- Use SemVer for the chart version ---
+          env.CHART_VERSION = "0.1.${BUILD_NUMBER}"
+
           sh """
+            set -e
             helm lint ${HELM_CHART_DIR} || true
             mkdir -p chart-packages
-            helm package ${HELM_CHART_DIR} --version ${BUILD_NUMBER} \
-              --app-version ${IMAGE_TAG} -d chart-packages
+            helm package ${HELM_CHART_DIR} \
+              --version ${CHART_VERSION} \
+              --app-version ${IMAGE_TAG} \
+              -d chart-packages
           """
-          env.CHART_TGZ    = sh(returnStdout: true, script: "ls chart-packages/*.tgz").trim()
-          env.CHART_VERSION = "${BUILD_NUMBER}"
+
+          env.CHART_TGZ = sh(returnStdout: true, script: "ls chart-packages/*.tgz").trim()
 
           withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
             sh """
+              set -e
               rm -rf helm-repo && git clone https://github.com/${HELM_REPO_GH}.git helm-repo
               cd helm-repo
-              git checkout gh-pages
+              git checkout gh-pages || git checkout -b gh-pages
+
+              # Copy the freshly packaged chart into the Pages worktree
               cp ../${CHART_TGZ} ./
+
+              # Build or merge index.yaml with the public URL
               if [ -f index.yaml ]; then
                 helm repo index . --url ${HELM_REPO_URL} --merge index.yaml
               else
                 helm repo index . --url ${HELM_REPO_URL}
               fi
+
               git add .
               git -c user.name="jenkins-bot" -c user.email="jenkins-bot@local" \
                 commit -m "Add chart ${APP_NAME}-${CHART_VERSION}, image ${IMAGE}:${IMAGE_TAG}" || true
+
               git push https://${GH_TOKEN}@github.com/${HELM_REPO_GH}.git gh-pages
             """
           }
@@ -79,9 +108,37 @@ pipeline {
       steps {
         script {
           sh """
-            helm repo add demo-charts ${HELM_REPO_URL} --force-update
-            helm repo update
+            set -e
+
+            # Add / refresh the chart repo
+            helm repo add demo-charts ${HELM_REPO_URL} --force-update || true
+
+            # Wait up to ~3 minutes for GitHub Pages to serve the updated index.yaml
+            FOUND=""
+            for i in {1..12}; do
+              helm repo update || true
+              # Does the repo list show our exact new version?
+              if helm search repo demo-charts/${APP_NAME} -l \
+                   | awk 'NR>1{print \$2}' \
+                   | grep -qx ${CHART_VERSION}; then
+                echo "Found ${APP_NAME} ${CHART_VERSION} in repo."
+                FOUND="yes"
+                break
+              fi
+              echo "Chart ${APP_NAME} ${CHART_VERSION} not visible yet. Waiting 15s... (\$i/12)"
+              sleep 15
+            done
+
+            if [ -z "\$FOUND" ]; then
+              echo "ERROR: Chart ${APP_NAME} ${CHART_VERSION} not visible in repo after waiting."
+              echo "Check gh-pages, index.yaml, and Pages propagation."
+              exit 1
+            fi
+
+            # Ensure namespace exists
             kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
+
+            # Deploy specific version built in this run
             helm upgrade --install demo demo-charts/${APP_NAME} \
               --version ${CHART_VERSION} \
               --namespace demo \
