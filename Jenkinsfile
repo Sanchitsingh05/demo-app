@@ -11,7 +11,7 @@ pipeline {
 
     // GitHub Pages repo that hosts packaged charts + index.yaml
     HELM_REPO_GH   = "Sanchitsingh05/helm-charts"
-    HELM_REPO_URL  = "https://Sanchitsingh05.github.io/helm-charts"
+    HELM_REPO_URL  = "https://sanchitsingh05.github.io/helm-charts"
     // ====================================================
   }
   options {
