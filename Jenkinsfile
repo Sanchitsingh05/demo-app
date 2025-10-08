@@ -7,10 +7,10 @@ pipeline {
     DOCKERHUB_USER = "sanchit0305"
     IMAGE          = "${DOCKERHUB_USER}/${APP_NAME}"
 
-    // Source chart lives inside the app repo
+    // The source Helm chart is inside this repo
     HELM_CHART_DIR = "helm/demo"
 
-    // GitHub Pages repo hosting packaged charts + index.yaml
+    // GitHub Pages repo that hosts packaged charts + index.yaml
     HELM_REPO_GH   = "Sanchitsingh05/helm-charts"
     HELM_REPO_URL  = "https://sanchitsingh05.github.io/helm-charts"
     // =============================================
@@ -18,7 +18,7 @@ pipeline {
 
   options {
     timestamps()
-    // disableConcurrentBuilds() // (optional) uncomment to prevent overlapping builds
+    // disableConcurrentBuilds() // uncomment if you want to prevent overlapping builds
   }
 
   stages {
@@ -30,6 +30,7 @@ pipeline {
       }
     }
 
+    // ---- DEBUG stage you requested ----
     stage('DEBUG show Jenkinsfile & env') {
       steps {
         sh '''
@@ -37,9 +38,9 @@ pipeline {
           sed -n '1,120p' Jenkinsfile || true
 
           echo "==== DEBUG: Key env values ===="
-          echo "HELM_REPO_URL=${HELM_REPO_URL}"
-          echo "APP_NAME=${APP_NAME}"
-          echo "IMAGE=${IMAGE}"
+          echo "HELM_REPO_URL=$HELM_REPO_URL"
+          echo "APP_NAME=$APP_NAME"
+          echo "IMAGE=$IMAGE"
         '''
       }
     }
@@ -47,24 +48,28 @@ pipeline {
     stage('Docker Build & Push') {
       steps {
         script {
-          def SHA = sh(returnStdout: true, script: 'cat .git/shortsha').trim()
+          // resolve short SHA and expose to shell as $SHA
+          env.SHA = sh(returnStdout: true, script: "cat .git/shortsha").trim()
 
-          sh """
+          // Build and push with only shell expansions
+          sh '''
             set -e
-            docker build -t ${IMAGE}:${SHA} -t ${IMAGE}:latest .
-          """
+            docker build -t "$IMAGE:$SHA" -t "$IMAGE:latest" .
+          '''
 
           withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
                                            usernameVariable: 'DH_USER',
                                            passwordVariable: 'DH_PASS')]) {
-            sh """
+            sh '''
               set -e
-              echo "${DH_PASS}" | docker login -u "${DH_USER}" --password-stdin
-              docker push ${IMAGE}:${SHA}
-              docker push ${IMAGE}:latest
-            """
+              echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+              docker push "$IMAGE:$SHA"
+              docker push "$IMAGE:latest"
+            '''
           }
-          env.IMAGE_TAG = SHA
+
+          // Publish the image tag for later stages
+          env.IMAGE_TAG = env.SHA
         }
       }
     }
@@ -75,44 +80,47 @@ pipeline {
         script {
           sh 'helm version && kubectl version --client'
 
-          // Use SemVer for chart versioning
-          env.CHART_VERSION = "0.1.${BUILD_NUMBER}"
+          // Use SemVer for the chart version (export to shell)
+          env.CHART_VERSION = "0.1.${env.BUILD_NUMBER}"
 
-          sh """
+          // Package chart to ./chart-packages
+          sh '''
             set -e
-            helm lint ${HELM_CHART_DIR} || true
+            helm lint "$HELM_CHART_DIR" || true
             mkdir -p chart-packages
-            helm package ${HELM_CHART_DIR} \
-              --version ${CHART_VERSION} \
-              --app-version ${IMAGE_TAG} \
+            helm package "$HELM_CHART_DIR" \
+              --version "$CHART_VERSION" \
+              --app-version "$IMAGE_TAG" \
               -d chart-packages
-          """
+          '''
 
+          // Find the packaged tgz (expose to shell as $CHART_TGZ)
           env.CHART_TGZ = sh(returnStdout: true, script: "ls chart-packages/*.tgz").trim()
 
+          // Push tgz + index.yaml to gh-pages
           withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-            sh """
+            sh '''
               set -e
-              rm -rf helm-repo && git clone https://github.com/${HELM_REPO_GH}.git helm-repo
+              rm -rf helm-repo && git clone "https://github.com/$HELM_REPO_GH.git" helm-repo
               cd helm-repo
               git checkout gh-pages || git checkout -b gh-pages
 
-              # Copy packaged chart into the Pages worktree
-              cp ../${CHART_TGZ} ./
+              # Copy freshly packaged chart into Pages worktree
+              cp "../$CHART_TGZ" ./
 
-              # Build/merge index.yaml using the public URL
+              # Create or merge index.yaml with the public URL
               if [ -f index.yaml ]; then
-                helm repo index . --url ${HELM_REPO_URL} --merge index.yaml
+                helm repo index . --url "$HELM_REPO_URL" --merge index.yaml
               else
-                helm repo index . --url ${HELM_REPO_URL}
+                helm repo index . --url "$HELM_REPO_URL"
               fi
 
               git add .
               git -c user.name="jenkins-bot" -c user.email="jenkins-bot@local" \
-                commit -m "Add chart ${APP_NAME}-${CHART_VERSION}, image ${IMAGE}:${IMAGE_TAG}" || true
+                commit -m "Add chart $APP_NAME-$CHART_VERSION, image $IMAGE:$IMAGE_TAG" || true
 
-              git push https://${GH_TOKEN}@github.com/${HELM_REPO_GH}.git gh-pages
-            """
+              git push "https://$GH_TOKEN@github.com/$HELM_REPO_GH.git" gh-pages
+            '''
           }
         }
       }
@@ -122,31 +130,35 @@ pipeline {
       when { branch 'main' }
       steps {
         script {
-          sh """
+          // POSIX-safe wait loop using seq; all $ vars are shell-expanded, not Groovy
+          sh '''
             set -e
 
-            # Add/refresh the public chart repo
-            helm repo add demo-charts ${HELM_REPO_URL} --force-update || true
+            # Add/refresh the public chart repo (lowercase URL already in HELM_REPO_URL)
+            helm repo add demo-charts "$HELM_REPO_URL" --force-update || true
 
-            # Wait up to ~3 minutes for GitHub Pages to serve updated index.yaml
+            # Wait up to ~3 minutes for GitHub Pages to serve the updated index.yaml
             ATTEMPTS=12
-            for i in \$(seq 1 \${ATTEMPTS}); do
+            for i in $(seq 1 $ATTEMPTS); do
               helm repo update || true
-              if helm search repo demo-charts/${APP_NAME} -l \
-                   | awk 'NR>1{print \\$2}' \
-                   | grep -qx ${CHART_VERSION}; then
-                echo "Found ${APP_NAME} ${CHART_VERSION} in repo."
+
+              # Does the repo show our exact new version?
+              if helm search repo "demo-charts/$APP_NAME" -l \
+                   | awk 'NR>1{print $2}' \
+                   | grep -qx "$CHART_VERSION"; then
+                echo "Found $APP_NAME $CHART_VERSION in repo."
                 FOUND=yes
                 break
               fi
-              echo "Chart ${APP_NAME} ${CHART_VERSION} not visible yet. Waiting 15s... (\\$i/\\${ATTEMPTS})"
+
+              echo "Chart $APP_NAME $CHART_VERSION not visible yet. Waiting 15s... ($i/$ATTEMPTS)"
               sleep 15
             done
 
             # Final verification before deploy
-            if ! helm search repo demo-charts/${APP_NAME} -l \
-                 | awk 'NR>1{print \\$2}' | grep -qx ${CHART_VERSION}; then
-              echo "ERROR: ${APP_NAME} ${CHART_VERSION} still not visible in repo. Check gh-pages & index.yaml"
+            if ! helm search repo "demo-charts/$APP_NAME" -l \
+                 | awk 'NR>1{print $2}' | grep -qx "$CHART_VERSION"; then
+              echo "ERROR: $APP_NAME $CHART_VERSION still not visible in repo. Check gh-pages & index.yaml"
               exit 1
             fi
 
@@ -154,14 +166,14 @@ pipeline {
             kubectl create namespace demo --dry-run=client -o yaml | kubectl apply -f -
 
             # Deploy the exact version we just published
-            helm upgrade --install demo demo-charts/${APP_NAME} \
-              --version ${CHART_VERSION} \
+            helm upgrade --install demo "demo-charts/$APP_NAME" \
+              --version "$CHART_VERSION" \
               --namespace demo \
-              --set image.repository=${IMAGE} \
-              --set image.tag=${IMAGE_TAG} \
-              --set service.nodePort=30080 \
+              --set "image.repository=$IMAGE" \
+              --set "image.tag=$IMAGE_TAG" \
+              --set "service.nodePort=30080" \
               --wait --timeout 120s
-          """
+          '''
         }
       }
     }
